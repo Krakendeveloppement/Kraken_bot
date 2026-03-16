@@ -1,42 +1,46 @@
 import streamlit as st
-import logging
-from chatterbot import ChatBot
-from chatterbot.trainers import ChatterBotCorpusTrainer
-import wikipediaapi
+import json
 import os
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import wikipediaapi
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Configuration
-logging.basicConfig(level=logging.INFO)
-
-# Titre de l'application
 st.set_page_config(page_title="Kraken_bot", page_icon="🐙")
 st.title("🐙 Kraken_bot - Assistant intelligent qui apprend")
 
-# Initialisation du bot (mise en cache pour ne pas le recharger à chaque interaction)
+# Initialisation du modèle d'embedding (mis en cache)
 @st.cache_resource
-def init_bot():
-    bot = ChatBot(
-        'Kraken_bot',
-        storage_adapter='chatterbot.storage.SQLStorageAdapter',
-        database_uri='sqlite:///kraken_database.sqlite3',  # Fichier local
-        logic_adapters=[
-            'chatterbot.logic.BestMatch',
-            'chatterbot.logic.MathematicalEvaluation',
-            'chatterbot.logic.TimeLogicAdapter'
-        ],
-        read_only=False
-    )
-    # Entraînement initial (si la base est vide)
-    trainer = ChatterBotCorpusTrainer(bot)
-    try:
-        trainer.train("chatterbot.corpus.french")
-    except:
-        trainer.train("chatterbot.corpus.english")
-    return bot
+def load_encoder():
+    return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')  # Modèle multilingue
 
-kraken = init_bot()
+encoder = load_encoder()
 
-# Initialisation de Wikipedia API
+# Initialisation de la base de connaissances (fichier JSON)
+KNOWLEDGE_FILE = "knowledge.json"
+
+def load_knowledge():
+    if os.path.exists(KNOWLEDGE_FILE):
+        with open(KNOWLEDGE_FILE, "r") as f:
+            return json.load(f)
+    else:
+        return {"q": [], "a": []}  # Listes de questions et réponses
+
+def save_knowledge(knowledge):
+    with open(KNOWLEDGE_FILE, "w") as f:
+        json.dump(knowledge, f)
+
+knowledge = load_knowledge()
+
+# Pré-calcul des embeddings pour les questions connues (pour accélérer)
+if "embeddings" not in st.session_state:
+    if knowledge["q"]:
+        st.session_state.embeddings = encoder.encode(knowledge["q"])
+    else:
+        st.session_state.embeddings = np.array([])
+
+# API Wikipedia
 wiki = wikipediaapi.Wikipedia('Kraken_bot (contact@example.com)', 'fr')
 
 def rechercher_wikipedia(question):
@@ -54,37 +58,59 @@ def rechercher_wikipedia(question):
         return f"🔍 Selon Wikipedia : {page.summary[:500]}..."
     return None
 
-# Gestion de l'historique de la conversation dans st.session_state
+def get_best_answer(question, threshold=0.7):
+    if not knowledge["q"]:
+        return None
+    # Encoder la question
+    q_emb = encoder.encode([question])
+    # Calculer similarité avec toutes les questions connues
+    sim = cosine_similarity(q_emb, st.session_state.embeddings)[0]
+    best_idx = np.argmax(sim)
+    if sim[best_idx] >= threshold:
+        return knowledge["a"][best_idx]
+    else:
+        return None
+
+def learn_new(question, answer):
+    knowledge["q"].append(question)
+    knowledge["a"].append(answer)
+    # Mettre à jour les embeddings
+    new_emb = encoder.encode([question])
+    if st.session_state.embeddings.size == 0:
+        st.session_state.embeddings = new_emb
+    else:
+        st.session_state.embeddings = np.vstack([st.session_state.embeddings, new_emb])
+    save_knowledge(knowledge)
+
+# Interface de chat
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Afficher les messages précédents
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Zone de saisie utilisateur
 if prompt := st.chat_input("Pose ta question à Kraken_bot"):
-    # Ajouter le message de l'utilisateur à l'historique
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Obtenir la réponse du bot
     with st.chat_message("assistant"):
         with st.spinner("Kraken_bot réfléchit..."):
-            response = kraken.get_response(prompt)
-            if response.confidence < 0.5:
-                wiki_reponse = rechercher_wikipedia(prompt)
-                if wiki_reponse:
-                    final_response = wiki_reponse
-                    # Apprendre cette nouvelle info
-                    kraken.learn_response(wiki_reponse, prompt)
-                else:
-                    # Demander à l'utilisateur d'enseigner
-                    final_response = "Je ne sais pas répondre à ça. Tu peux m'apprendre en modifiant le code ou en utilisant la version locale."
-                    # Ici on pourrait stocker la question pour apprentissage différé
+            # Chercher une réponse connue
+            answer = get_best_answer(prompt)
+            if answer:
+                final_response = answer
             else:
-                final_response = response.text
+                # Sinon, chercher sur Wikipedia
+                wiki_res = rechercher_wikipedia(prompt)
+                if wiki_res:
+                    final_response = wiki_res
+                    # Apprendre cette nouvelle info
+                    learn_new(prompt, wiki_res)
+                else:
+                    # Demander à l'utilisateur d'enseigner (simulé ici)
+                    final_response = "Je ne sais pas encore répondre à ça. Tu peux m'apprendre en modifiant le code ou en utilisant la version locale."
+                    # Pour un apprentissage interactif, il faudrait un mécanisme plus complexe
             st.markdown(final_response)
             st.session_state.messages.append({"role": "assistant", "content": final_response})
